@@ -8,9 +8,11 @@
 import datetime as dt
 import html
 import os
+import re
 import sqlite3
+import zipfile
 
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -304,11 +306,106 @@ def tenders(cat: str = ""):
 <span class="meta">{esc(r['tdr_id'])} ｜ {esc(r['region'])} ｜ {esc(r['publish_date'])} ｜ 附件{r['n_att']}</span>
 {entries}</div>"""
     body = f"""<h2>项目总览 · 标注入口</h2>
-<div class="card meta">按类别进入标注任务。分类由关键词规则自动判定（只取标题，剥掉代理机构名），不进人工队列。</div>
+<div class="card meta">按类别进入标注任务。分类由关键词规则自动判定（只取标题，剥掉代理机构名），不进人工队列。
+<a class="btn y" href="/upload" style="float:right">上传招标文件</a></div>
 <div>{cat_cards} <a href="/tenders" style="text-decoration:none;color:inherit">
 <div class="card" style="display:inline-block;width:120px;text-align:center"><b>全部</b></div></a></div>
 {trs or '<div class="empty">该类别暂无项目</div>'}"""
     return PAGE.format(title="项目总览", body=body)
+
+
+# ---------- 上传招标文件(真实原料入口; 标书不上传, 由AI生成) ----------
+def _next_upload_tdr_id(c):
+    year = dt.date.today().year
+    prefix = f"TDR-UPLD-{year}-"
+    row = c.execute("SELECT tdr_id FROM tender WHERE tdr_id LIKE ? ORDER BY tdr_id DESC LIMIT 1",
+                    (prefix + "%",)).fetchone()
+    seq = int(row["tdr_id"].rsplit("-", 1)[1]) + 1 if row else 1
+    return prefix + f"{seq:05d}"
+
+
+def _docx_text(path):
+    """stdlib 抽 docx 正文(不上传依赖); .doc/扫描PDF返回空"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "replace")
+        xml = re.sub(r"</w:p>", "\n", xml)
+        return re.sub(r"<[^>]+>", "", xml).strip()
+    except Exception:
+        return ""
+
+
+@app.get("/upload", response_class=HTMLResponse)
+def upload_form():
+    body = """<h2>上传招标文件</h2>
+<div class="card meta">平台的真实原料只有招标文件（采购文件 + 公告），它是 rubric 解析和标书构造的锚点，必须真实。
+投标标书不需要上传——case 由 AI 生成基线并注入偏差。<br>
+支持 .docx（自动抽正文）/ .pdf（正文请粘贴公告文本，扫描件后续走 OCR）/ .zip（自动解包登记每个文件）。</div>
+<div class="card"><form method="post" action="/upload" enctype="multipart/form-data">
+<p>项目名称：<input type="text" name="title" size="60" required></p>
+<p>地区：<input type="text" name="region" size="20" placeholder="如 广东东莞"></p>
+<p>公告正文（可选，docx 可自动抽取；PDF 建议粘贴）：<br>
+<textarea name="notice" rows="10" placeholder="粘贴招标公告正文，用于规则分类与解析参照"></textarea></p>
+<p>文件（可多选）：<input type="file" name="files" multiple></p>
+<button class="btn y">上传</button></form></div>"""
+    return PAGE.format(title="上传招标文件", body=body)
+
+
+@app.post("/upload")
+async def upload_do(title: str = Form(...), region: str = Form(""),
+                    notice: str = Form(""), files: list[UploadFile] = File(...)):
+    c = db()
+    tdr_id = _next_upload_tdr_id(c)
+    tdir = os.path.join(ROOT, "data", "raw", tdr_id)
+    os.makedirs(tdir, exist_ok=True)
+
+    saved = []
+    for uf in files:
+        if not uf.filename:
+            continue
+        blob = await uf.read()
+        fname = re.sub(r'[\\/:*?"<>|]', "_", uf.filename)
+        fpath = os.path.join(tdir, fname)
+        with open(fpath, "wb") as f:
+            f.write(blob)
+        if fname.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(fpath) as z:
+                    for info in z.infolist():
+                        if info.is_dir():
+                            continue
+                        inner = re.sub(r'[\\/:*?"<>|]', "_", os.path.basename(info.filename))
+                        if not inner:
+                            continue
+                        ipath = os.path.join(tdir, inner)
+                        with open(ipath, "wb") as f:
+                            f.write(z.read(info))
+                        saved.append((inner, ipath, os.path.getsize(ipath)))
+            except zipfile.BadZipFile:
+                saved.append((fname, fpath, len(blob)))
+        else:
+            saved.append((fname, fpath, len(blob)))
+
+    # 公告正文: 手贴优先, 否则从第一个 docx 抽
+    detail = notice.strip()
+    if not detail:
+        for fname, fpath, _ in saved:
+            if fname.lower().endswith(".docx"):
+                detail = _docx_text(fpath)
+                if detail:
+                    break
+    with open(os.path.join(tdir, "detail.txt"), "w", encoding="utf-8") as f:
+        f.write(detail)
+
+    c.execute("""INSERT INTO tender(tdr_id,source,url,title,publish_date,region,bid_type,status,fetched_at)
+                 VALUES (?,?,?,?,?,?,?,?,?)""",
+              (tdr_id, "upload", f"upload://{tdr_id}", title, dt.date.today().isoformat(),
+               region, "公开招标", "raw", dt.datetime.now().isoformat(timespec="seconds")))
+    for fname, fpath, size in saved:
+        c.execute("INSERT OR IGNORE INTO attachment(tdr_id,filename,url,path,size) VALUES (?,?,?,?,?)",
+                  (tdr_id, fname, f"upload://{tdr_id}/{fname}", fpath, size))
+    c.commit()
+    return RedirectResponse("/tenders", status_code=303)
 
 
 # ---------- Rubric 规则编辑 ----------
