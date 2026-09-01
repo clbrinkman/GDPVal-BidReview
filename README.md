@@ -192,4 +192,5 @@ rubric 条目是从需求文档**解析**出来的（规划：OpenBidKit 18 解�
 - `platform/app.py` — FastAPI 人工工作台（单文件，无构建步骤）
 - `项目讨论纪要.md` — 设计文档（持续更新）
 - `agent交互记录.md` — 与 agent 协作的完整记录（数据构造→质检全流程 + 关键决策点）
+- `prompts/generation_prompts.md` — 生成 prompt 集（P1 rubric 抽取 / P2 基线标书 / P3 偏差注入 / P4 注入自检）
 - `data/` — 爬取的 48 个真实招标项目 + 平台库（含种子演示数据，开箱即用）
