@@ -9,6 +9,35 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(ROOT, "data", "platform.db")
 
+SCHEMA_BASE = """
+CREATE TABLE IF NOT EXISTS tender (
+    tdr_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    url TEXT UNIQUE NOT NULL,
+    title TEXT,
+    publish_date TEXT,
+    region TEXT,
+    bid_type TEXT,
+    status TEXT DEFAULT 'raw',
+    fetched_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS attachment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tdr_id TEXT NOT NULL REFERENCES tender(tdr_id),
+    filename TEXT,
+    url TEXT,
+    path TEXT,
+    size INTEGER,
+    UNIQUE(tdr_id, url)
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 SCHEMA_V1 = """
 ALTER TABLE attachment ADD COLUMN is_tender_doc INTEGER;  -- 1是 0否 NULL未审
 """
@@ -77,6 +106,47 @@ SCHEMA_V8 = """
 ALTER TABLE rubric_item ADD COLUMN review_result TEXT;  -- NULL待审 / 保留|改写|删除
 ALTER TABLE rubric_item ADD COLUMN draft TEXT;          -- 暂存的verdict(未提交)
 ALTER TABLE rubric_item ADD COLUMN note TEXT;
+"""
+
+SCHEMA_V9 = """
+ALTER TABLE review_check ADD COLUMN review_kind TEXT NOT NULL DEFAULT 'expert';
+ALTER TABLE review_check ADD COLUMN required_reviews INTEGER NOT NULL DEFAULT 2;
+ALTER TABLE review_check ADD COLUMN blind_mode TEXT NOT NULL DEFAULT 'case_alias';
+
+CREATE TABLE IF NOT EXISTS expert_review (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    check_id INTEGER NOT NULL REFERENCES review_check(id),
+    reviewer_id TEXT NOT NULL,
+    round INTEGER NOT NULL DEFAULT 1,
+    verdict TEXT,
+    confidence INTEGER,
+    rationale TEXT,
+    evidence_refs TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    started_at TEXT,
+    submitted_at TEXT,
+    duration_s REAL,
+    UNIQUE(check_id, reviewer_id, round)
+);
+
+CREATE TABLE IF NOT EXISTS expert_resolution (
+    check_id INTEGER PRIMARY KEY REFERENCES review_check(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    final_verdict TEXT,
+    adjudicator_id TEXT,
+    rationale TEXT,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    payload_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 SCHEMA_V1_REST = """
@@ -187,23 +257,26 @@ def _run(conn, script):
         conn.execute(stmt)
 
 
-def migrate():
-    conn = sqlite3.connect(DB_PATH)
-    _run(conn, SCHEMA_V1)
-    _run(conn, SCHEMA_V1_REST)
-    _run(conn, SCHEMA_V2)
-    _run(conn, SCHEMA_V3)
-    _run(conn, SCHEMA_V4)
-    _run(conn, SCHEMA_V5)
-    _run(conn, SCHEMA_V6)
-    _run(conn, SCHEMA_V7)
-    _run(conn, SCHEMA_V8)
-    conn.executescript(TAXONOMY)
-    conn.commit()
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
-    conn.close()
-    return tables
+def migrate(db_path=DB_PATH):
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(SCHEMA_BASE)
+        scripts = [SCHEMA_V1, SCHEMA_V1_REST, SCHEMA_V2, SCHEMA_V3,
+                   SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+                   SCHEMA_V9]
+        for version, script in enumerate(scripts, start=1):
+            _run(conn, script)
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", (version,))
+        conn.executescript(TAXONOMY)
+        conn.commit()
+        return [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

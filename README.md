@@ -7,7 +7,16 @@
 本仓库是其中的**数据治理 + 后期人工工作台** prototype，覆盖 选题（爬虫）→ 构造（注入）→ 质检（人工校验）闭环中
 "人"的那一环，设计目标是**尽可能少的人工**：能走规则的不进人工队列，必须人工的做成 <30 秒可判的自描述卡片。
 
-运行：`python platform/app.py` → http://127.0.0.1:8321 （Python 3.13，依赖 fastapi / uvicorn / requests / bs4 / lxml）
+运行（Python 3.11+）：
+
+```bash
+python -m pip install -e '.[dev]'
+python platform/db.py        # 新建或升级数据库，可重复执行
+python platform/seed_demo.py  # 仅在需要显式初始化演示数据时运行
+python platform/app.py
+```
+
+打开 http://127.0.0.1:8321。读取页面不会再隐式写入演示数据。
 
 ## 已实现功能
 
@@ -17,13 +26,14 @@
 - **项目总览（标注入口）**：类别卡（工程/货物/服务）→ 项目 → 三类标注任务，实时待审数；
   分类走关键词规则（剥代理机构名前缀，命中词可溯源），不设人工
 - **生成节点审核**：N1 输入解析 → N2 基线合规 → N3 偏差注入 → N4 成稿质量，任一驳回即回炉
-- **专家校验**：law/scheme/plaus/inj 四区，点选绿色高亮 + 上一条/暂存(draft)/提交/下一条
+- **专家校验 v2**：独立双盲提交、置信度与证据定位、自动一致/冲突判定、第三方仲裁、审计日志
 - **规则标注**：rubric 条目保留/改写（文本直接写回）/删除，同款暂存/提交交互
 - **规则编辑**：rubric 库、条目编辑、模板绑定多项目
 - **环境文件**：噪声环境展示（含证据绿/噪声红/普通灰）+ PDF 阅读器（原生渲染兼容扫描件，按页反馈）
 - **辅助队列**：GT 校验（gt_status 状态机）、finding 裁决、附件校准
-- **治理**：六前缀编号、五类错误法典、全部判定可撤销回退、暂存/提交两态、schema 迁移 V1-V8
-- **演示数据**：5 case / 59 校验项 / 34 环境文件 / 44 rubric 条目 / 4 注入 GT，开箱即用
+- **治理**：六前缀编号、五类错误法典、全部判定可撤销回退、暂存/提交两态、schema 迁移 V1-V9
+- **演示数据**：仓库数据库包含 5 case / 59 校验项 / 34 环境文件 / 44 rubric 条目 / 4 注入 GT；
+  其中多数 case/env 文件仍是 UI 演示记录，尚不能作为完整 benchmark run 使用
 
 ## 未来待实现功能
 
@@ -181,6 +191,8 @@ rubric 条目是从需求文档**解析**出来的（规划：OpenBidKit 18 解�
 - **项目总览** `/tenders` — 标注入口：类别卡（工程/货物/服务，规则自动分类）→ 项目 → 三类标注任务（节点+环境 / 专家校验 / 规则标注），实时待审数
 - **标注视图** `/case/{id}` — 生成节点 N1-N4 审核卡 + 环境文件（含证据绿/噪声红/普通灰，PDF 阅读器按页反馈）
 - **专家校验** `/case/{id}/expert` — 四区判定：点选高亮 → 上一条/暂存/提交/下一条
+- **专家工作台 v2** `/expert/work?reviewer=expert-a` — 盲样本队列与独立提交
+- **冲突仲裁** `/expert/conflicts` — 仅呈现双审冲突，第三方给最终结论
 - **规则标注** `/rubrics/{id}/annotate` — rubric 条目同款标注：保留/改写（文本直接写回）/删除
 - **规则编辑** `/rubrics` — rubric 库、条目编辑、模板绑定项目
 - 辅助队列：GT 校验 `/queue/gt`、裁决 `/queue/adjudication`、附件校准 `/queue/attachments`
@@ -190,6 +202,7 @@ rubric 条目是从需求文档**解析**出来的（规划：OpenBidKit 18 解�
 - `scraper/ccgp.py` — 中国政府采购网爬虫（频道列表→详情→附件），产物 `data/raw/{tdr_id}/`
 - `platform/db.py` — SQLite schema 迁移（V1-V8，`data/platform.db`）
 - `platform/app.py` — FastAPI 人工工作台（单文件，无构建步骤）
+- `docs/HUMAN_IN_THE_LOOP_SPEC.md` — 人工 Gate、角色权限、专家 UI 与发布验收规范
 - `项目讨论纪要.md` — 设计文档（持续更新）
 - `agent交互记录.md` — 与 agent 协作的完整记录（数据构造→质检全流程 + 关键决策点）
 - `prompts/generation_prompts.md` — 生成 prompt 集（P1 rubric 抽取 / P2 基线标书 / P3 偏差注入 / P4 注入自检）

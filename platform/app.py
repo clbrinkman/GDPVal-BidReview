@@ -6,7 +6,9 @@
 运行: python platform/app.py  ->  http://127.0.0.1:8321
 """
 import datetime as dt
+import hashlib
 import html
+import json
 import os
 import re
 import sqlite3
@@ -59,9 +61,13 @@ select,input[type=text],input[type=number]{{font-size:13px;padding:4px}}
 .badge.g{{background:#eef7ee;color:#2e7d32;border:1px solid #cfe4cf}}
 .badge.r{{background:#fde8e8;color:#c0392b;border:1px solid #f5c6c6}}
 .guess{{color:#b76e00;font-size:12px}}
+.workspace{{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.75fr);gap:16px;align-items:start}}
+.sticky{{position:sticky;top:12px}} .progress{{height:8px;background:#ececea;border-radius:8px;overflow:hidden}}
+.progress>span{{display:block;height:100%;background:#2e7d32}} .warn{{border-left:4px solid #b76e00}}
+label.option{{display:block;border:1px solid #e2e2de;border-radius:6px;padding:8px;margin:6px 0;cursor:pointer}}
 code,.tid{{font-family:Consolas,'SF Mono',monospace;font-size:12px;color:#8a8a85}}
 </style></head><body>
-<nav><a href="/tenders"><b>项目总览</b></a><a href="/case"><b>标注视图</b></a><a href="/rubrics"><b>规则编辑</b></a></nav>
+<nav><a href="/tenders"><b>项目总览</b></a><a href="/case"><b>标注视图</b></a><a href="/rubrics"><b>规则编辑</b></a><a href="/expert/work"><b>专家工作台 v2</b></a><a href="/expert/conflicts"><b>冲突仲裁</b></a></nav>
 {body}
 <script>
 document.addEventListener('keydown',e=>{{
@@ -78,7 +84,6 @@ def index():
 
 @app.get("/case", response_class=HTMLResponse)
 def case_entry():
-    seed_rich()
     c = db()
     row = c.execute("""SELECT b.case_id, COUNT(r.id) n FROM bid_case b
                        LEFT JOIN review_check r ON r.case_id=b.case_id
@@ -422,8 +427,9 @@ def rubric_list():
         kind = '<span class="badge g">模板</span>' if r["is_template"] else f'专用:{esc(r["tdr_id"])}'
         pend = c.execute("SELECT COUNT(*) n FROM rubric_item WHERE rubric_id=? AND review_result IS NULL",
                          (r["rubric_id"],)).fetchone()["n"]
-        ann = (f'<a href="/rubrics/{esc(r["rubric_id"])}/annotate">'
-               f'{"<span class=\"badge r\">待审" + str(pend) + "</span>" if pend else "<span class=\"badge g\">✓</span>"}</a>')
+        ann_status = (f'<span class="badge r">待审{pend}</span>' if pend
+                      else '<span class="badge g">✓</span>')
+        ann = f'<a href="/rubrics/{esc(r["rubric_id"])}/annotate">{ann_status}</a>'
         trs += f"""<tr><td><a href="/rubrics/{esc(r['rubric_id'])}">{esc(r['rubric_id'])}</a></td>
 <td>{kind}</td><td>{esc(r['status'])}</td><td>{r['n_items']} 条</td>
 <td>{r['n_bound'] if r['is_template'] else '—'}</td><td>{ann}</td></tr>"""
@@ -750,7 +756,6 @@ def seed_demo():
 
 @app.get("/review", response_class=HTMLResponse)
 def review_list():
-    seed_demo()
     c = db()
     cases = c.execute("SELECT * FROM bid_case ORDER BY case_id DESC").fetchall()
     trs = ""
@@ -850,6 +855,154 @@ EXPERT_AREAS = {
 }
 
 
+def blind_alias(check_id: int, case_id: str) -> str:
+    token = hashlib.sha256(f"{check_id}:{case_id}".encode()).hexdigest()[:8].upper()
+    return f"SAMPLE-{token}"
+
+
+def expert_resolution_status(c, check_id: int, required_reviews: int = 2):
+    rows = c.execute("""SELECT verdict FROM expert_review
+                        WHERE check_id=? AND status='submitted' ORDER BY id""",
+                     (check_id,)).fetchall()
+    if len(rows) < required_reviews:
+        return "pending", None
+    verdicts = {r["verdict"] for r in rows}
+    if len(verdicts) == 1:
+        return "agreed", rows[0]["verdict"]
+    return "conflict", None
+
+
+@app.get("/expert/work", response_class=HTMLResponse)
+def expert_work(reviewer: str = "expert-a", area: str = ""):
+    """Independent, blinded review queue. Auth is intentionally out of scope for the prototype."""
+    c = db()
+    params = [reviewer]
+    area_sql = ""
+    if area:
+        area_sql = " AND r.expert_area=?"
+        params.append(area)
+    rows = c.execute(f"""SELECT r.*, er.status own_status
+        FROM review_check r
+        LEFT JOIN expert_review er ON er.check_id=r.id AND er.reviewer_id=? AND er.round=1
+        WHERE r.node='EXP' {area_sql}
+        ORDER BY (er.status='submitted'), r.id""", params).fetchall()
+    pending = [r for r in rows if r["own_status"] != "submitted"]
+    done = len(rows) - len(pending)
+    pct = int(done * 100 / len(rows)) if rows else 100
+    chips = " ".join(f'<a class="badge" href="/expert/work?reviewer={esc(reviewer)}&area={k}">{esc(v[0])}</a>'
+                     for k, v in EXPERT_AREAS.items())
+    cards = "".join(f"""<tr><td>{blind_alias(r['id'], r['case_id'])}</td>
+<td>{esc(EXPERT_AREAS.get(r['expert_area'], (r['expert_area'],))[0])}</td>
+<td>{esc(r['item'])}</td><td><a class="btn s" href="/expert/task/{r['id']}?reviewer={esc(reviewer)}">开始</a></td></tr>"""
+                    for r in pending)
+    body = f"""<h2>专家工作台 v2</h2>
+<div class="card"><b>当前审核人</b> {esc(reviewer)} <span class="meta">（原型用 query 参数；生产环境由登录身份注入）</span><br>
+<div class="progress"><span style="width:{pct}%"></span></div><span class="meta">已提交 {done}/{len(rows)}</span></div>
+<div class="card">{chips} <a class="badge" href="/expert/work?reviewer={esc(reviewer)}">全部</a></div>
+<div class="card meta">盲审中不显示 case ID、clean/injected 标签、其他专家结论或预期答案。每位专家独立提交。</div>
+<table><tr><th>盲样本</th><th>任务</th><th>问题</th><th></th></tr>{cards}</table>"""
+    return PAGE.format(title="专家工作台 v2", body=body)
+
+
+@app.get("/expert/task/{check_id}", response_class=HTMLResponse)
+def expert_task(check_id: int, reviewer: str = "expert-a"):
+    c = db()
+    chk = c.execute("SELECT * FROM review_check WHERE id=? AND node='EXP'", (check_id,)).fetchone()
+    if not chk:
+        return HTMLResponse("专家任务不存在", status_code=404)
+    own = c.execute("SELECT * FROM expert_review WHERE check_id=? AND reviewer_id=? AND round=1",
+                    (check_id, reviewer)).fetchone()
+    name, verdicts = EXPERT_AREAS.get(chk["expert_area"], ("专家判断", ["通过", "驳回", "无法判断"]))
+    current = own["verdict"] if own else ""
+    options = "".join(f'<label class="option"><input type="radio" name="verdict" value="{esc(v)}" '
+                      f'{"checked" if current == v else ""}> {esc(v)}</label>' for v in verdicts)
+    submitted = own and own["status"] == "submitted"
+    body = f"""<h2>{name}</h2><div class="card meta">{blind_alias(check_id, chk['case_id'])} ｜ 独立盲审 ｜ 审核人 {esc(reviewer)}</div>
+<div class="workspace"><main><div class="card"><b>{esc(chk['item'])}</b><pre>{esc(chk['artifact'])}</pre></div></main>
+<aside class="card sticky"><form method="post" action="/expert/task/{check_id}">
+<input type="hidden" name="reviewer" value="{esc(reviewer)}"><input type="hidden" name="started_at" value="{dt.datetime.now().isoformat(timespec='seconds')}">
+{options}<label>置信度（1–5）</label><input type="number" min="1" max="5" required name="confidence" value="{esc(own['confidence'] if own else 3)}"><br><br>
+<label>判断依据（必填）</label><textarea required name="rationale">{esc(own['rationale'] if own else '')}</textarea>
+<label>证据定位（页码/章节/字段）</label><input type="text" name="evidence_refs" value="{esc(own['evidence_refs'] if own else '')}"><br><br>
+<button class="btn s" name="mode" value="draft">暂存</button><button class="btn y" name="mode" value="submit">提交</button>
+</form>{'<div class="badge g">已提交；再次提交会更新本人的记录并留审计日志</div>' if submitted else ''}</aside></div>"""
+    return PAGE.format(title=name, body=body)
+
+
+@app.post("/expert/task/{check_id}")
+def expert_task_save(check_id: int, reviewer: str = Form(...), verdict: str = Form(...),
+                     confidence: int = Form(...), rationale: str = Form(...),
+                     evidence_refs: str = Form(""), mode: str = Form("draft"),
+                     started_at: str = Form("")):
+    if confidence not in range(1, 6) or mode not in {"draft", "submit"}:
+        return HTMLResponse("参数无效", status_code=400)
+    c = db()
+    chk = c.execute("SELECT required_reviews FROM review_check WHERE id=? AND node='EXP'", (check_id,)).fetchone()
+    if not chk:
+        return HTMLResponse("专家任务不存在", status_code=404)
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    status = "submitted" if mode == "submit" else "draft"
+    c.execute("""INSERT INTO expert_review
+        (check_id,reviewer_id,round,verdict,confidence,rationale,evidence_refs,status,started_at,submitted_at)
+        VALUES (?,?,1,?,?,?,?,?,?,?)
+        ON CONFLICT(check_id,reviewer_id,round) DO UPDATE SET verdict=excluded.verdict,
+        confidence=excluded.confidence,rationale=excluded.rationale,evidence_refs=excluded.evidence_refs,
+        status=excluded.status,submitted_at=excluded.submitted_at""",
+        (check_id, reviewer, verdict, confidence, rationale, evidence_refs, status,
+         started_at or now, now if status == "submitted" else None))
+    resolution, final = expert_resolution_status(c, check_id, chk["required_reviews"])
+    c.execute("""INSERT INTO expert_resolution(check_id,status,final_verdict)
+                 VALUES (?,?,?) ON CONFLICT(check_id) DO UPDATE SET
+                 status=excluded.status,final_verdict=excluded.final_verdict""", (check_id, resolution, final))
+    c.execute("INSERT INTO audit_event(entity_type,entity_id,action,actor_id,payload_json) VALUES (?,?,?,?,?)",
+              ("expert_review", str(check_id), status, reviewer,
+               json.dumps({"verdict": verdict, "confidence": confidence}, ensure_ascii=False)))
+    c.commit()
+    return RedirectResponse(f"/expert/work?reviewer={reviewer}", status_code=303)
+
+
+@app.get("/expert/conflicts", response_class=HTMLResponse)
+def expert_conflicts():
+    c = db()
+    rows = c.execute("""SELECT x.check_id,r.item,r.expert_area FROM expert_resolution x
+                        JOIN review_check r ON r.id=x.check_id WHERE x.status='conflict' ORDER BY x.check_id""").fetchall()
+    trs = "".join(f'<tr><td>{blind_alias(r["check_id"], str(r["check_id"]))}</td><td>{esc(r["item"])}</td>'
+                  f'<td><a class="btn q" href="/expert/conflicts/{r["check_id"]}">仲裁</a></td></tr>' for r in rows)
+    return PAGE.format(title="冲突仲裁", body=f"<h2>冲突仲裁</h2><div class='card meta'>仅显示两名以上专家已独立提交且结论不一致的任务。</div><table><tr><th>任务</th><th>问题</th><th></th></tr>{trs}</table>")
+
+
+@app.get("/expert/conflicts/{check_id}", response_class=HTMLResponse)
+def expert_conflict(check_id: int):
+    c = db()
+    chk = c.execute("SELECT * FROM review_check WHERE id=?", (check_id,)).fetchone()
+    reviews = c.execute("SELECT * FROM expert_review WHERE check_id=? AND status='submitted' ORDER BY id", (check_id,)).fetchall()
+    if not chk or len(reviews) < 2:
+        return HTMLResponse("冲突任务不存在", status_code=404)
+    cards = "".join(f'<div class="card"><b>专家 {i+1}</b> ｜ {esc(r["verdict"])} ｜ 置信度 {r["confidence"]}<pre>{esc(r["rationale"])}</pre><span class="meta">证据：{esc(r["evidence_refs"])}</span></div>' for i, r in enumerate(reviews))
+    verdicts = EXPERT_AREAS.get(chk["expert_area"], (None, ["通过", "驳回", "无法判断"]))[1]
+    opts = "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in verdicts)
+    body = f"""<h2>第三方仲裁</h2><div class="card"><b>{esc(chk['item'])}</b><pre>{esc(chk['artifact'])}</pre></div>{cards}
+<form class="card" method="post" action="/expert/conflicts/{check_id}"><input name="adjudicator" required placeholder="仲裁人 ID">
+<select name="verdict">{opts}</select><textarea name="rationale" required placeholder="仲裁依据；说明采纳或推翻哪项证据"></textarea>
+<button class="btn y">确认最终结论</button></form>"""
+    return PAGE.format(title="第三方仲裁", body=body)
+
+
+@app.post("/expert/conflicts/{check_id}")
+def expert_conflict_save(check_id: int, adjudicator: str = Form(...), verdict: str = Form(...), rationale: str = Form(...)):
+    c = db()
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    c.execute("""UPDATE expert_resolution SET status='adjudicated',final_verdict=?,adjudicator_id=?,rationale=?,resolved_at=?
+                 WHERE check_id=? AND status='conflict'""", (verdict, adjudicator, rationale, now, check_id))
+    if not c.total_changes:
+        return HTMLResponse("任务不是待仲裁状态", status_code=409)
+    c.execute("INSERT INTO audit_event(entity_type,entity_id,action,actor_id,payload_json) VALUES (?,?,?,?,?)",
+              ("expert_resolution", str(check_id), "adjudicated", adjudicator,
+               json.dumps({"verdict": verdict, "rationale": rationale}, ensure_ascii=False)))
+    c.commit()
+    return RedirectResponse("/expert/conflicts", status_code=303)
+
+
 def seed_expert():
     c = db()
     if c.execute("SELECT COUNT(*) n FROM review_check WHERE node='EXP'").fetchone()["n"]:
@@ -882,8 +1035,6 @@ def seed_expert():
 
 @app.get("/expert", response_class=HTMLResponse)
 def expert_entry(cat: str = ""):
-    seed_expert()
-    seed_env()
     c = db()
     rows = c.execute("""
         SELECT b.case_id, t.category, t.title, t.region,
